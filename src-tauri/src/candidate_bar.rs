@@ -1,27 +1,29 @@
+use skia_safe::{Canvas, Color, Font, FontMgr, FontStyle, Paint, PaintStyle, Rect, Surface};
 use std::sync::{Arc, Mutex};
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject,
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, DIB_RGB_COLORS, HDC,
+    BeginPaint, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EndPaint,
+    GetDC, GetDesktopWindow, GetDeviceCaps, GetWindowDC, ReleaseDC, SelectObject,
+    UpdateLayeredWindow, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+    PAINTSTRUCT, RGBQUAD,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW,
-    GetWindowLongPtrW, PostMessageW, RegisterClassExW, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, UpdateLayeredWindow,
-    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HWND_TOPMOST,
-    MSG, SW_HIDE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
-    SW_SHOWNA, ULW_ALPHA, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetMessageW, LoadCursorW,
+    PostMessageW, RegisterClassW, SetWindowPos, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
+    CW_USEDEFAULT, HMENU, HWND_BOTTOM, HWND_TOPMOST, IDC_ARROW,
+    MSG, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_CREATE, WM_DESTROY, WM_PAINT, WS_CAPTION, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP, WS_SYSMENU,
 };
 
-use skia_safe::{
-    BlurStyle, Color, Color4f, ColorType, Font, FontMgr, FontStyle,
-    ImageInfo, MaskFilter, Paint, Point, Rect, surfaces,
-    Typeface, AlphaType,
-};
-
-const RENDER_MSG: u32 = 0x8001;
+const RENDER_MSG: u32 = WM_PAINT + 100;
+const CANVAS_WIDTH: i32 = 680;
+const CANVAS_HEIGHT: i32 = 52;
+const CANDIDATE_WIDTH: f32 = 68.0;
+const CANDIDATE_GAP: f32 = 4.0;
+const BAR_PADDING: f32 = 12.0;
+const CORNER_RADIUS: f32 = 10.0;
+const PREEDIT_HEIGHT: f32 = 20.0;
 
 #[derive(Clone)]
 pub struct BarData {
@@ -49,110 +51,171 @@ impl Default for BarData {
             pos_x: 100,
             pos_y: 300,
             theme: "light".into(),
-            primary_color: (74, 108, 247),
+            primary_color: (70, 130, 180),
         }
     }
 }
 
 struct BarContext {
     state: Arc<Mutex<BarData>>,
-    typeface: Typeface,
+    hwnd: isize,
+    typeface: skia_safe::Typeface,
+}
+
+fn get_bar_size(data: &BarData) -> (f32, f32) {
+    let count = data.candidates.len().max(1) as f32;
+    let w = count * CANDIDATE_WIDTH + (count - 1.0) * CANDIDATE_GAP + BAR_PADDING * 2.0;
+    let h = if data.preedit.is_empty() {
+        CANVAS_HEIGHT as f32
+    } else {
+        CANVAS_HEIGHT as f32 + PREEDIT_HEIGHT
+    };
+    (w, h)
 }
 
 pub fn start_bar(state: Arc<Mutex<BarData>>, hwnd_out: Arc<Mutex<isize>>) {
-    std::thread::spawn(move || run_bar(state, hwnd_out));
+    std::thread::spawn(move || {
+        run_bar(state, hwnd_out);
+    });
 }
 
 fn run_bar(state: Arc<Mutex<BarData>>, hwnd_out: Arc<Mutex<isize>>) {
-    let hinst = unsafe {
-        windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap()
+    let fm = FontMgr::default();
+    let typeface = fm
+        .match_family_style("Microsoft YaHei", FontStyle::default())
+        .or_else(|| fm.match_family_style("Arial", FontStyle::default()))
+        .or_else(|| fm.default_family_style())
+        .expect("No font available");
+
+    let hinstance = unsafe {
+        windows::Win32::System::LibraryLoader::GetModuleHandleA(None)
     };
 
-    let cn = wide("LexiCandBarSkia");
-    let wc = WNDCLASSEXW {
-        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+    let class_name = windows::core::w!("LexiCandidateBar");
+
+    let wc = windows::Win32::UI::WindowsAndMessaging::WNDCLASSW {
         style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(bar_wndproc),
-        hInstance: hinst.into(),
-        lpszClassName: PCWSTR(cn.as_ptr()),
-        ..Default::default()
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: hinstance,
+        hIcon: None,
+        hCursor: Some(unsafe { LoadCursorW(None, IDC_ARROW) }),
+        hbrBackground: None,
+        lpszMenuName: None,
+        lpszClassName: class_name,
     };
-    unsafe { RegisterClassExW(&wc); }
+
+    let atom = unsafe { RegisterClassW(&wc) };
+    if atom == 0 {
+        return;
+    }
 
     let hwnd = unsafe {
         CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
-            PCWSTR(cn.as_ptr()),
-            PCWSTR::null(),
-            WS_POPUP,
-            CW_USEDEFAULT, CW_USEDEFAULT, 400, 80,
-            None, None, hinst, None,
+            WINDOW_EX_STYLE(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW),
+            class_name,
+            windows::core::w!(""),
+            WINDOW_STYLE(WS_POPUP),
+            100,
+            300,
+            200,
+            50,
+            None,
+            HMENU(std::ptr::null_mut()),
+            hinstance,
+            None,
         )
     };
-    let hwnd = match hwnd {
-        Ok(h) => {
-            *hwnd_out.lock().unwrap() = h.0 as isize;
-            h
-        }
-        Err(_) => return,
+
+    if hwnd.is_invalid() {
+        return;
+    }
+
+    {
+        let mut hwnd_guard = hwnd_out.lock().unwrap();
+        *hwnd_guard = hwnd.0 as isize;
+    }
+
+    let ctx = BarContext {
+        state,
+        hwnd: hwnd.0 as isize,
+        typeface,
     };
 
-    let fm = FontMgr::default();
-    let typeface = fm.match_family_style("Microsoft YaHei", FontStyle::default())
-        .or_else(|| fm.match_family_style("Arial", FontStyle::default()))
-        .expect("No font available");
-
-    let ctx = Box::new(BarContext { state, typeface });
-    unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(ctx) as isize); }
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+        );
+    }
 
     let mut msg = MSG::default();
-    loop {
-        let ret = unsafe { GetMessageW(&mut msg, None, 0, 0) };
-        if ret.0 <= 0 { break; }
-        unsafe { DispatchMessageW(&msg); }
-    }
-}
-
-unsafe extern "system" fn bar_wndproc(
-    hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM,
-) -> LRESULT {
-    if msg == RENDER_MSG {
-        let raw = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
-        if raw == 0 { return LRESULT(0); }
-
-        let ctx: &BarContext = unsafe { &*(raw as *const BarContext) };
-        let data = ctx.state.lock().unwrap().clone();
-
-        if data.visible && !data.candidates.is_empty() {
-            unsafe {
-                render_frame(hwnd, &data, &ctx.typeface);
-                ShowWindow(hwnd, SW_SHOWNA);
-                SetWindowPos(hwnd, HWND_TOPMOST,
-                    data.pos_x, data.pos_y - 32, 0, 0,
-                    SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER);
-            }
-        } else {
-            unsafe { ShowWindow(hwnd, SW_HIDE); }
+    unsafe {
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            TranslateMessage(&msg);
+            let _ = DefWindowProcW(msg.hwnd, msg.message, msg.wParam, msg.lParam);
         }
-        return LRESULT(0);
     }
-
-    if msg == windows::Win32::UI::WindowsAndMessaging::WM_DESTROY {
-        let raw = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
-        if raw != 0 { let _ = unsafe { Box::from_raw(raw as *mut BarContext) }; }
-        unsafe { windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0); }
-        return LRESULT(0);
-    }
-
-    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
-unsafe fn render_frame(hwnd: HWND, data: &BarData, typeface: &Typeface) {
-    let n = data.candidates.len().max(1);
-    let w = (n as i32 * 68 + 60).max(200);
-    let h = if data.preedit.is_empty() { 48 } else { 68 };
+extern "system" fn bar_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_CREATE => {
+            let create_struct = unsafe { &*(lparam.0 as *const windows::Win32::UI::WindowsAndMessaging::CREATESTRUCTW) };
+            LRESULT(0)
+        }
+        RENDER_MSG => {
+            let ptr = unsafe {
+                let p = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(hwnd, 0);
+                if p == 0 {
+                    return LRESULT(0);
+                }
+                p as *mut BarContext
+            };
+            let ctx = unsafe { &mut *ptr };
+            render_frame(hwnd, ctx);
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            let ptr = unsafe {
+                let p = windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(hwnd, 0);
+                p as *mut BarContext
+            };
+            if !ptr.is_null() {
+                let _ = unsafe { Box::from_raw(ptr) };
+            }
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
 
-    let bi = BITMAPINFO {
+fn render_frame(hwnd: HWND, ctx: &BarContext) {
+    let snapshot = {
+        let guard = ctx.state.lock().unwrap();
+        (*guard).clone()
+    };
+
+    let is_dark = snapshot.theme == "dark";
+    let (w, h) = get_bar_size(&snapshot);
+    let w = w as i32;
+    let h = h as i32;
+
+    let hdc = unsafe { GetDC(None) };
+    if hdc.is_invalid() {
+        return;
+    }
+
+    let dib_size = w * h * 4;
+    let mut bmi = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
             biWidth: w,
@@ -161,175 +224,207 @@ unsafe fn render_frame(hwnd: HWND, data: &BarData, typeface: &Typeface) {
             biBitCount: 32,
             biCompression: BI_RGB.0,
             biSizeImage: 0,
-            ..Default::default()
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
         },
-        bmiColors: [std::mem::zeroed(); 1],
+        bmiColors: [RGBQUAD::default(); 1],
     };
 
     let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-    let dib = unsafe { CreateDIBSection(HDC::default(), &bi, DIB_RGB_COLORS, &mut bits, None, 0) };
-    let dib = match dib {
-        Ok(d) => d,
-        Err(_) => return,
+    let dib = unsafe { CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0) };
+    if dib.is_invalid() || bits.is_null() {
+        unsafe { let _ = ReleaseDC(None, hdc); }
+        return;
+    }
+
+    let mdc = unsafe { CreateCompatibleDC(hdc) };
+    if mdc.is_invalid() {
+        unsafe {
+            let _ = ReleaseDC(None, hdc);
+            let _ = DeleteObject(dib);
+        }
+        return;
+    }
+
+    let old_bmp = unsafe { SelectObject(mdc, dib) };
+
+    let bits_len = dib_size as usize;
+    let bytes = unsafe { std::slice::from_raw_parts_mut(bits as *mut u8, bits_len) };
+
+    draw_skia(w, h, &snapshot, &ctx.typeface, bytes);
+
+    let mut blend = windows::Win32::Graphics::Gdi::BLENDFUNCTION {
+        BlendOp: 0,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: 1,
     };
 
-    let dc = unsafe { CreateCompatibleDC(HDC::default()) };
-    let old_bmp = unsafe { SelectObject(dc, dib) };
-
-    draw_skia(w, h, data, typeface, bits);
-
-    let bf = BLENDFUNCTION { BlendOp: 0, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: 1 };
-    let mut pt = POINT::default();
-    let mut sz = SIZE { cx: w, cy: h };
-    let mut ps = POINT::default();
     unsafe {
         let _ = UpdateLayeredWindow(
-            hwnd, HDC::default(), Some(&mut pt), Some(&mut sz),
-            dc, Some(&mut ps), COLORREF::default(), Some(&bf), ULW_ALPHA,
+            hwnd,
+            hdc,
+            None,
+            None,
+            Some(mdc),
+            Some(&POINT { x: 0, y: 0 }),
+            0,
+            Some(&blend),
+            windows::Win32::Graphics::Gdi::ULW_ALPHA,
         );
-        SelectObject(dc, old_bmp);
-        DeleteDC(dc);
-        DeleteObject(dib);
+    }
+
+    unsafe {
+        let _ = SelectObject(mdc, old_bmp);
+        let _ = DeleteDC(mdc);
+        let _ = DeleteObject(dib);
+        let _ = ReleaseDC(None, hdc);
     }
 }
 
-fn to_color4f(c: Color) -> Color4f {
-    Color4f::new(
-        c.r() as f32 / 255.0,
-        c.g() as f32 / 255.0,
-        c.b() as f32 / 255.0,
-        c.a() as f32 / 255.0,
+struct RenderCache {
+    candidate_count: usize,
+    has_preedit: bool,
+    w: i32,
+    h: i32,
+    font_large: Font,
+    font_small: Font,
+    font_index: Font,
+}
+
+fn get_or_create_fonts(typeface: &skia_safe::Typeface) -> (Font, Font, Font) {
+    (
+        Font::from_typeface(typeface.clone(), 18.0),
+        Font::from_typeface(typeface.clone(), 14.0),
+        Font::from_typeface(typeface.clone(), 11.0),
     )
 }
 
-fn draw_skia(w: i32, h: i32, data: &BarData, typeface: &Typeface, bits: *mut std::ffi::c_void) {
-    if bits.is_null() { return; }
-
-    let image_info = ImageInfo::new(
-        (w, h),
-        ColorType::BGRA8888,
-        AlphaType::Premul,
-        None,
-    );
-
-    let row_bytes = (w * 4) as usize;
-    let total = row_bytes * h as usize;
-    let dst_slice = unsafe { std::slice::from_raw_parts_mut(bits as *mut u8, total) };
-
-    let mut surface = surfaces::wrap_pixels(
-        &image_info,
-        dst_slice,
-        row_bytes,
-        None,
-    ).expect("Failed to create Skia surface");
+fn draw_skia(
+    w: i32,
+    h: i32,
+    data: &BarData,
+    typeface: &skia_safe::Typeface,
+    pixels: &mut [u8],
+) {
+    let mut surface = unsafe {
+        Surface::new_legacy_render_target(
+            pixels.as_mut_ptr(),
+            w as i32,
+            h as i32,
+            w as i32 * 4,
+            None,
+        )
+    };
 
     let canvas = surface.canvas();
     canvas.clear(Color::TRANSPARENT);
 
     let is_dark = data.theme == "dark";
-    let (pr, pg, pb) = data.primary_color;
-    let accent = Color::from_argb(255, pr, pg, pb);
-    let accent_bg = Color::from_argb(26, pr, pg, pb);
+    let (r, g, b) = data.primary_color;
+    let primary = Color::from_rgb(r, g, b);
 
-    draw_background(canvas, w, h, is_dark);
-    draw_candidates_skia(canvas, w, h, data, typeface, accent, accent_bg, is_dark);
-}
-
-fn draw_background(canvas: &skia_safe::Canvas, w: i32, h: i32, is_dark: bool) {
-    let r = 12.0;
-    let rect = Rect::from_xywh(1.0, 1.0, (w - 2) as f32, (h - 2) as f32);
-
-    let shadow_c = if is_dark {
-        Color::from_argb(80, 0, 0, 0)
+    let bg_color = if is_dark {
+        Color::from_argb(220, 30, 30, 30)
     } else {
-        Color::from_argb(25, 0, 0, 0)
+        Color::from_argb(220, 245, 245, 245)
     };
-
-    let mut shadow_paint = Paint::new(to_color4f(shadow_c), None);
-    shadow_paint.set_anti_alias(true);
-    shadow_paint.set_mask_filter(MaskFilter::blur(BlurStyle::Normal, 6.0, None));
-    canvas.draw_round_rect(&rect, r, r, &shadow_paint);
-
-    let (bg_top, _bg_bot) = if is_dark {
-        ((28, 28, 33, 240), (20, 20, 24, 225))
-    } else {
-        ((255, 255, 255, 235), (245, 245, 250, 215))
-    };
-    let bg = Color::from_argb(bg_top.3, bg_top.0, bg_top.1, bg_top.2);
-
-    let mut bg_paint = Paint::new(to_color4f(bg), None);
-    bg_paint.set_anti_alias(true);
-    canvas.draw_round_rect(&rect, r, r, &bg_paint);
-}
-
-fn draw_candidates_skia(
-    canvas: &skia_safe::Canvas,
-    w: i32,
-    _h: i32,
-    data: &BarData,
-    typeface: &Typeface,
-    accent: Color,
-    accent_bg: Color,
-    is_dark: bool,
-) {
-    let font_large = Font::from_typeface(typeface.clone(), 18.0);
-    let font_small = Font::from_typeface(typeface.clone(), 14.0);
-    let font_index = Font::from_typeface(typeface.clone(), 11.0);
 
     let text_color = if is_dark {
-        Color::from_argb(255, 224, 224, 224)
+        Color::from_rgb(240, 240, 240)
     } else {
-        Color::from_argb(255, 34, 34, 34)
-    };
-    let idx_color = if is_dark {
-        Color::from_argb(255, 128, 128, 128)
-    } else {
-        Color::from_argb(255, 160, 160, 160)
-    };
-    let page_color = if is_dark {
-        Color::from_argb(255, 96, 96, 96)
-    } else {
-        Color::from_argb(255, 153, 153, 153)
+        Color::from_rgb(40, 40, 40)
     };
 
-    let y_start = if data.preedit.is_empty() { 14.0 } else { 34.0 };
+    let active_bg = Color::from_argb(60, r, g, b);
+    let preedit_offset = if data.preedit.is_empty() {
+        0.0
+    } else {
+        PREEDIT_HEIGHT
+    };
 
-    for (i, cand) in data.candidates.iter().enumerate() {
-        let x = 16.0 + i as f32 * 68.0;
-        let active = i == data.active_index;
+    let rect = Rect::new(0.0, 0.0, w as f32, h as f32);
+    draw_background(canvas, rect, bg_color);
 
-        if active {
-            let mut bg_paint = Paint::new(to_color4f(accent_bg), None);
-            bg_paint.set_anti_alias(true);
-            let bg_rect = Rect::from_xywh(x - 2.0, y_start - 2.0, 60.0, 24.0);
-            canvas.draw_round_rect(&bg_rect, 6.0, 6.0, &bg_paint);
-        }
-
-        let idx_text = (i + 1).to_string();
-        let mut idx_paint = Paint::new(to_color4f(if active { accent } else { idx_color }), None);
-        idx_paint.set_anti_alias(true);
-        canvas.draw_str(&idx_text, (x + 2.0, y_start + 13.0), &font_index, &idx_paint);
-
-        let mut txt_paint = Paint::new(to_color4f(if active { accent } else { text_color }), None);
-        txt_paint.set_anti_alias(true);
-        canvas.draw_str(cand, (x + 22.0, y_start + 15.0), &font_large, &txt_paint);
-    }
-
-    if data.total_pages > 1 {
-        let page_str = format!("{}/{}", data.page_no + 1, data.total_pages);
-        let mut paint = Paint::new(to_color4f(page_color), None);
-        paint.set_anti_alias(true);
-        canvas.draw_str(&page_str, ((w - 48) as f32, (_h - 6) as f32), &font_small, &paint);
-    }
+    draw_candidates(
+        canvas,
+        data,
+        primary,
+        text_color,
+        bg_color,
+        active_bg,
+        typeface,
+        preedit_offset,
+    );
 }
 
-fn wide(s: &str) -> Vec<u16> {
-    let mut v: Vec<u16> = s.encode_utf16().collect();
-    v.push(0);
-    v
+fn draw_background(canvas: &Canvas, rect: Rect, bg_color: Color) {
+    let mut paint = Paint::new(bg_color, None);
+    paint.set_anti_alias(true);
+    let rrect = skia_safe::RRect::new_rect_radii(
+        rect,
+        &[CORNER_RADIUS; 4].into(),
+    );
+    canvas.draw_rrect(rrect, &paint);
+}
+
+fn draw_candidates(
+    canvas: &Canvas,
+    data: &BarData,
+    primary: Color,
+    text_color: Color,
+    bg_color: Color,
+    active_bg: Color,
+    typeface: &skia_safe::Typeface,
+    preedit_offset: f32,
+) {
+    let (font_large, font_small, font_index) = get_or_create_fonts(typeface);
+
+    let candidate_count = data.candidates.len().max(1);
+    let bar_width = candidate_count as f32 * CANDIDATE_WIDTH
+        + (candidate_count as f32 - 1.0) * CANDIDATE_GAP
+        + BAR_PADDING * 2.0;
+
+    let y_center = CANVAS_HEIGHT as f32 / 2.0 + 6.0 + preedit_offset;
+
+    for (i, candidate) in data.candidates.iter().enumerate() {
+        let x = BAR_PADDING + i as f32 * (CANDIDATE_WIDTH + CANDIDATE_GAP);
+
+        if i == data.active_index {
+            let mut highlight = Paint::new(active_bg, None);
+            highlight.set_anti_alias(true);
+            let hr = skia_safe::RRect::new_rect_radii(
+                Rect::new(x, y_center - 10.0, x + CANDIDATE_WIDTH, y_center + 14.0),
+                &[6.0; 4].into(),
+            );
+            canvas.draw_rrect(hr, &highlight);
+        }
+
+        let index_text = format!("{}", i + 1);
+        canvas.draw_str(
+            &index_text,
+            x + 4.0,
+            y_center,
+            &font_index,
+            &Paint::new(primary, None),
+        );
+
+        canvas.draw_str(
+            candidate,
+            x + 22.0,
+            y_center + 0.5,
+            &font_large,
+            &Paint::new(text_color, None),
+        );
+    }
 }
 
 pub fn signal_update(hwnd: isize) {
-    if hwnd == 0 { return; }
-    unsafe { PostMessageW(HWND(hwnd as *mut _), RENDER_MSG, WPARAM(0), LPARAM(0)); }
+    if hwnd != 0 {
+        unsafe {
+            let _ = PostMessageW(HWND(hwnd as _), RENDER_MSG, WPARAM(0), LPARAM(0));
+        }
+    }
 }
