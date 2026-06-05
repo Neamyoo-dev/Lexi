@@ -1,21 +1,12 @@
-#![allow(non_snake_case, non_camel_case_types, dead_code)]
-
 mod pipe_client;
 mod text_service;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use windows::core::{implement, ComObject, GUID, HRESULT, PCWSTR};
-use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::System::Com::{
-    ClassFactory, IClassFactory, IUnknown, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
-};
-use windows::Win32::UI::TextServices::{
-    ITfTextInputProcessor, ITfTextInputProcessorEx, TLIBID_MSFT,
-    TF_INPUTPROCESSOR_PROFILE, TF_PROFILETYPE_INPUTPROCESSOR,
-};
-use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, RegisterClassW, WNDCLASSW,
-};
+use windows::core::{implement, GUID, HRESULT};
+use windows::Win32::Foundation::{BOOL, HINSTANCE};
+use windows::Win32::System::Com::{IClassFactory, IUnknown};
+use windows::Win32::System::LibraryLoader::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH};
+use windows::Win32::UI::TextServices::ITfTextInputProcessor;
 
 pub const CLSID_LEXI_IME: GUID = GUID::from_u128(0x12340001_0000_0000_C000_000000000046);
 
@@ -29,10 +20,10 @@ pub extern "system" fn DllMain(
     _reserved: *mut std::ffi::c_void,
 ) -> BOOL {
     match reason {
-        1 => {
+        DLL_PROCESS_ATTACH => {
             DLL_INSTANCE.set(hinst).ok();
         }
-        0 => {
+        DLL_PROCESS_DETACH => {
             pipe_client::disconnect();
         }
         _ => {}
@@ -47,18 +38,18 @@ pub unsafe extern "system" fn DllGetClassObject(
     ppv: *mut *mut std::ffi::c_void,
 ) -> HRESULT {
     if rclsid.is_null() || riid.is_null() || ppv.is_null() {
-        return HRESULT(-0x7ff8ffffi32); // E_POINTER
+        return HRESULT(-0x7ff8ffffi32);
     }
 
     let clsid = *rclsid;
     if clsid != CLSID_LEXI_IME {
-        return HRESULT(-0x7ff8fffei32); // CLASS_E_CLASSNOTAVAILABLE
+        return HRESULT(-0x7ff8fffei32);
     }
 
     let factory = LexiClassFactory::new();
     let factory_unknown: IUnknown = factory.into();
 
-    let result = factory_unknown.query(&*riid, ppv as *mut *mut std::ffi::c_void);
+    let result = factory_unknown.query(riid, ppv as *mut *mut std::ffi::c_void);
 
     if result.is_ok() {
         std::mem::forget(factory_unknown);
@@ -70,9 +61,9 @@ pub unsafe extern "system" fn DllGetClassObject(
 #[no_mangle]
 pub unsafe extern "system" fn DllCanUnloadNow() -> HRESULT {
     if LEXI_ACTIVE.load(Ordering::SeqCst) {
-        HRESULT(1) // S_FALSE
+        HRESULT(1)
     } else {
-        HRESULT(0) // S_OK
+        HRESULT(0)
     }
 }
 
