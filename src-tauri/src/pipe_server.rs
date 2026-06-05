@@ -78,22 +78,42 @@ where
     F: Fn(String) -> Option<String> + Send + Sync + 'static,
 {
     let mut buffer = vec![0u8; BUFFER_SIZE];
+    let mut read_offset = 0usize;
 
     loop {
-        match server.read(&mut buffer).await {
+        match server.read(&mut buffer[read_offset..]).await {
             Ok(0) => break,
             Ok(n) => {
-                let request = String::from_utf8_lossy(&buffer[..n]).to_string();
+                read_offset += n;
+
+                let request = String::from_utf8_lossy(&buffer[..read_offset]).to_string();
+                let request = request.trim_end_matches('\0').to_string();
+
                 let response = handler(request);
 
-                let data = match response {
-                    Some(ref resp) => resp.as_bytes(),
-                    None => b"{}",
+                let data = match &response {
+                    Some(resp) => resp.as_bytes(),
+                    None => br#"{"handled":false}"#,
                 };
 
                 if let Err(e) = server.write_all(data).await {
                     eprintln!("Pipe write error: {}", e);
                     break;
+                }
+
+                read_offset = 0;
+
+                let mut remaining = vec![0u8; BUFFER_SIZE];
+                match server.read(&mut remaining).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buffer[..n].copy_from_slice(&remaining[..n]);
+                        read_offset = n;
+                    }
+                    Err(e) => {
+                        eprintln!("Pipe read error: {}", e);
+                        break;
+                    }
                 }
             }
             Err(e) => {
