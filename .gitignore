@@ -29,8 +29,8 @@ src-tauri/target/
 # Tauri generated schemas
 src-tauri/gen/schemas
 
-# AI generated analysis / audit files (moved to docs/)
-docs/*.md
+# Design docs / planning
+.grill/
 
 # OS metadata
 Thumbs.db
