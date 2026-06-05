@@ -1,4 +1,4 @@
-# Lexi 输入法
+# Lexi
 
 > [!WARNING]
 > This project is still under heavy development. It is not yet ready for daily use.
@@ -43,6 +43,12 @@ cargo tauri dev
 # Unregister
 .\scripts\unregister-tsf.ps1
 ```
+
+## Contributing
+
+Contributions are welcome! Feel free to open issues and pull requests.
+
+Before submitting significant changes, it is recommended to first open an issue to discuss the approach. This helps ensure your effort aligns with the project direction.
 
 ## License
 
