@@ -22,3 +22,16 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Rust / Cargo (generated at compile time)
+src-tauri/target/
+
+# Tauri generated schemas
+src-tauri/gen/schemas
+
+# AI generated analysis / audit files (moved to docs/)
+docs/*.md
+
+# OS metadata
+Thumbs.db
+Desktop.ini
