@@ -3,7 +3,7 @@ mod ime;
 mod pipe_server;
 
 use candidate_bar::BarData;
-use ime::rime::{ContextData, RimeEngine, StatusData};
+use ime::rime::{ContextData, KeyResult, RimeEngine, StatusData};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{
@@ -19,6 +19,42 @@ struct AppState {
     bar_hwnd: Arc<Mutex<isize>>,
 }
 
+fn lock_bar<'a>(state: &'a AppState) -> Result<std::sync::MutexGuard<'a, BarData>, String> {
+    state.bar_state.lock().map_err(|_| "Mutex poisoned".to_string())
+}
+
+fn lock_hwnd<'a>(state: &'a AppState) -> Result<std::sync::MutexGuard<'a, isize>, String> {
+    state.bar_hwnd.lock().map_err(|_| "Mutex poisoned".to_string())
+}
+
+fn update_bar_from_context(state: &AppState, ctx: &ContextData) {
+    if let Ok(mut bar) = lock_bar(state) {
+        bar.preedit = ctx.preedit.clone();
+        bar.candidates = ctx.candidates.iter().map(|c| c.text.clone()).collect();
+        bar.active_index = ctx.highlighted_index as usize;
+        bar.page_no = ctx.page_no as usize;
+        bar.visible = true;
+    }
+    if let Ok(hwnd) = lock_hwnd(state) {
+        if *hwnd != 0 {
+            candidate_bar::signal_update(*hwnd);
+        }
+    }
+}
+
+fn hide_bar(state: &AppState) {
+    if let Ok(mut bar) = lock_bar(state) {
+        bar.visible = false;
+        bar.preedit.clear();
+        bar.candidates.clear();
+    }
+    if let Ok(hwnd) = lock_hwnd(state) {
+        if *hwnd != 0 {
+            candidate_bar::signal_update(*hwnd);
+        }
+    }
+}
+
 #[tauri::command]
 fn init_ime(app: AppHandle, state: State<AppState>) -> Result<(), String> {
     if state.initialized.load(Ordering::SeqCst) {
@@ -31,25 +67,17 @@ fn init_ime(app: AppHandle, state: State<AppState>) -> Result<(), String> {
 
 #[tauri::command]
 fn process_key(state: State<AppState>, keycode: i32, modifiers: i32) -> Result<Option<ContextData>, String> {
-    let result = state.engine.process_key(keycode, modifiers)?;
-
-    if let Some(ref ctx) = result {
-        let mut bar = state.bar_state.lock().unwrap();
-        bar.preedit = ctx.preedit.clone();
-        bar.candidates = ctx.candidates.iter().map(|c| c.text.clone()).collect();
-        bar.active_index = ctx.highlighted_index as usize;
-        bar.page_no = ctx.page_no as usize;
-        bar.total_pages = if ctx.is_last_page { ctx.page_no + 1 } else { ctx.page_no + 2 } as usize;
-        bar.visible = true;
-        candidate_bar::signal_update(*state.bar_hwnd.lock().unwrap());
-    } else {
-        let mut bar = state.bar_state.lock().unwrap();
-        bar.visible = false;
-        bar.candidates.clear();
-        candidate_bar::signal_update(*state.bar_hwnd.lock().unwrap());
+    match state.engine.process_key(keycode, modifiers)? {
+        KeyResult::Handled(ctx) => {
+            if !ctx.commit_text.is_empty() {
+                hide_bar(&state);
+            } else {
+                update_bar_from_context(&state, &ctx);
+            }
+            Ok(Some(ctx))
+        }
+        KeyResult::NotHandled => Ok(None),
     }
-
-    Ok(result)
 }
 
 #[tauri::command]
@@ -58,10 +86,9 @@ fn select_candidate(state: State<AppState>, index: i32) -> Result<Option<Context
 
     if let Some(ref ctx) = result {
         if !ctx.commit_text.is_empty() {
-            let mut bar = state.bar_state.lock().unwrap();
-            bar.visible = false;
-            bar.candidates.clear();
-            candidate_bar::signal_update(*state.bar_hwnd.lock().unwrap());
+            hide_bar(&state);
+        } else {
+            update_bar_from_context(&state, ctx);
         }
     }
 
@@ -71,10 +98,7 @@ fn select_candidate(state: State<AppState>, index: i32) -> Result<Option<Context
 #[tauri::command]
 fn clear_composition(state: State<AppState>) -> Result<(), String> {
     state.engine.clear_composition()?;
-    let mut bar = state.bar_state.lock().unwrap();
-    bar.visible = false;
-    bar.candidates.clear();
-    candidate_bar::signal_update(*state.bar_hwnd.lock().unwrap());
+    hide_bar(&state);
     Ok(())
 }
 
@@ -85,26 +109,41 @@ fn get_ime_status(state: State<AppState>) -> Result<StatusData, String> {
 
 #[tauri::command]
 fn update_bar_theme(state: State<AppState>, theme: String) -> Result<(), String> {
-    let mut bar = state.bar_state.lock().unwrap();
-    bar.theme = theme;
-    candidate_bar::signal_update(*state.bar_hwnd.lock().unwrap());
+    lock_bar(&state)?.theme = theme;
+    if let Ok(hwnd) = lock_hwnd(&state) {
+        if *hwnd != 0 {
+            candidate_bar::signal_update(*hwnd);
+        }
+    }
     Ok(())
 }
 
 #[tauri::command]
 fn update_bar_color(state: State<AppState>, r: u8, g: u8, b: u8) -> Result<(), String> {
-    let mut bar = state.bar_state.lock().unwrap();
-    bar.primary_color = (r, g, b);
-    candidate_bar::signal_update(*state.bar_hwnd.lock().unwrap());
+    lock_bar(&state)?.primary_color = (r, g, b);
+    if let Ok(hwnd) = lock_hwnd(&state) {
+        if *hwnd != 0 {
+            candidate_bar::signal_update(*hwnd);
+        }
+    }
     Ok(())
 }
 
 #[tauri::command]
 fn update_bar_position(state: State<AppState>, x: i32, y: i32) -> Result<(), String> {
-    let mut bar = state.bar_state.lock().unwrap();
+    let mut bar = lock_bar(&state)?;
     bar.pos_x = x;
     bar.pos_y = y;
     Ok(())
+}
+
+fn format_pipe_response(ctx: &ContextData) -> String {
+    serde_json::json!({
+        "handled": true,
+        "commit": ctx.commit_text,
+        "preedit": ctx.preedit,
+        "candidates": ctx.candidates.iter().map(|c| &c.text).collect::<Vec<_>>(),
+    }).to_string()
 }
 
 fn create_pipe_handler(handle: AppHandle) -> impl Fn(String) -> Option<String> {
@@ -114,18 +153,31 @@ fn create_pipe_handler(handle: AppHandle) -> impl Fn(String) -> Option<String> {
             Err(_) => return Some(r#"{"handled":false}"#.into()),
         };
 
-        if msg.get("type").and_then(|t| t.as_str()) == Some("keydown") {
-            let keycode = msg["keycode"].as_i64().unwrap_or(0) as i32;
-            let modifiers = msg["modifiers"].as_i64().unwrap_or(0) as i32;
-
-            let _ = handle.emit(
-                "tsf_key_event",
-                serde_json::json!({ "keycode": keycode, "modifiers": modifiers }),
-            );
-            return Some(r#"{"handled":true}"#.into());
+        if msg.get("type").and_then(|t| t.as_str()) != Some("keydown") {
+            return Some(r#"{"handled":false}"#.into());
         }
 
-        Some(r#"{"handled":false}"#.into())
+        let keycode = msg["keycode"].as_i64().unwrap_or(0) as i32;
+        let modifiers = msg["modifiers"].as_i64().unwrap_or(0) as i32;
+
+        let state: State<AppState> = handle.state();
+
+        match state.engine.process_key(keycode, modifiers) {
+            Ok(KeyResult::Handled(ctx)) => {
+                if !ctx.commit_text.is_empty() {
+                    hide_bar(&state);
+                } else {
+                    update_bar_from_context(&state, &ctx);
+                }
+
+                Some(format_pipe_response(&ctx))
+            }
+            Ok(KeyResult::NotHandled) => Some(r#"{"handled":false}"#.into()),
+            Err(e) => {
+                eprintln!("process_key error: {}", e);
+                Some(r#"{"handled":false}"#.into())
+            }
+        }
     }
 }
 
