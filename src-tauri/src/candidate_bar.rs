@@ -209,6 +209,18 @@ fn render_frame(hwnd: HWND, ctx: &BarContext) {
     let w = w as i32;
     let h = h as i32;
 
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            snapshot.pos_x,
+            snapshot.pos_y - h - 4,
+            w,
+            h,
+            SWP_SHOWWINDOW,
+        );
+    }
+
     let hdc = unsafe { GetDC(None) };
     if hdc.is_invalid() {
         return;

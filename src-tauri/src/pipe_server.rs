@@ -19,6 +19,10 @@ impl PipeServer {
         }
     }
 
+    pub fn trigger_shutdown(&self) {
+        self.notify.notify_one();
+    }
+
     pub async fn start<F>(&self, handler: F) -> Result<(), String>
     where
         F: Fn(String) -> Option<String> + Send + Sync + 'static,
@@ -55,7 +59,7 @@ impl PipeServer {
                     });
                 }
                 Err(e) => {
-                    eprintln!("Pipe connect failed: {}", e);
+                    log::error!("Pipe connect failed: {}", e);
                 }
             }
         }
@@ -97,7 +101,7 @@ where
                 };
 
                 if let Err(e) = server.write_all(data).await {
-                    eprintln!("Pipe write error: {}", e);
+                    log::error!("Pipe write error: {}", e);
                     break;
                 }
 
@@ -111,13 +115,13 @@ where
                         read_offset = n;
                     }
                     Err(e) => {
-                        eprintln!("Pipe read error: {}", e);
+                        log::error!("Pipe read error: {}", e);
                         break;
                     }
                 }
             }
             Err(e) => {
-                eprintln!("Pipe read error: {}", e);
+                log::error!("Pipe read error: {}", e);
                 break;
             }
         }

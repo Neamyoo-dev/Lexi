@@ -1,29 +1,38 @@
 use std::sync::Mutex;
-use windows::Win32::Foundation::{BOOL, HANDLE, INVALID_HANDLE_VALUE};
+use windows::Win32::Foundation::{BOOL, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, FILE_GENERIC_READ, FILE_GENERIC_WRITE, OPEN_EXISTING,
 };
-use windows::Win32::System::IO::{
-    CreateEventW, GetOverlappedResult, Overlapped, SetFileCompletionNotificationModes,
-    FILE_SKIP_SET_EVENT_ON_HANDLE,
+use windows::Win32::System::IO::OVERLAPPED;
+use windows::Win32::System::Pipes::WaitNamedPipeW;
+use windows::Win32::System::Threading::{
+    CreateEventW, WaitForSingleObject,
 };
-use windows::Win32::System::Pipes::{
-    CallNamedPipeW, ConnectNamedPipe, DisconnectNamedPipe, WaitNamedPipeW,
-};
-use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE, WAIT_OBJECT_0};
 
-use windows::core::{Error, PCWSTR};
+use windows::core::PCWSTR;
 
 const PIPE_NAME: &str = r"\\.\pipe\LexiInputMethod";
 const BUFFER_SIZE: usize = 4096;
 const PIPE_TIMEOUT_MS: u32 = 500;
 
-static PIPE_HANDLE: Mutex<Option<HANDLE>> = Mutex::new(None);
+static PIPE_HANDLE: Mutex<Option<isize>> = Mutex::new(None);
 static PIPE_STATE: Mutex<Option<PipeState>> = Mutex::new(None);
 
+struct SafeOverlapped(OVERLAPPED);
+unsafe impl Send for SafeOverlapped {}
+unsafe impl Sync for SafeOverlapped {}
+
 struct PipeState {
-    handle: HANDLE,
-    overlapped: Overlapped,
+    handle: isize,
+    overlapped: SafeOverlapped,
+}
+
+fn to_handle(val: isize) -> HANDLE {
+    HANDLE(val as *mut std::ffi::c_void)
+}
+
+fn from_handle(handle: HANDLE) -> isize {
+    handle.0 as isize
 }
 
 pub fn connect() -> Result<(), String> {
@@ -72,11 +81,12 @@ pub fn connect() -> Result<(), String> {
         return Err("Failed to create event".into());
     }
 
-    let mut overlapped = Overlapped::default();
+    let mut overlapped = OVERLAPPED::default();
     overlapped.hEvent = event;
 
-    let state = PipeState { handle, overlapped };
-    *handle_guard = Some(handle);
+    let handle_isize = from_handle(handle);
+    let state = PipeState { handle: handle_isize, overlapped: SafeOverlapped(overlapped) };
+    *handle_guard = Some(handle_isize);
     *PIPE_STATE.lock().unwrap() = Some(state);
 
     Ok(())
@@ -86,7 +96,7 @@ pub fn disconnect() {
     let mut handle_guard = PIPE_HANDLE.lock().unwrap();
     if let Some(handle) = handle_guard.take() {
         unsafe {
-            let _ = windows::Win32::Foundation::CloseHandle(handle);
+            let _ = windows::Win32::Foundation::CloseHandle(to_handle(handle));
         }
     }
     *PIPE_STATE.lock().unwrap() = None;
@@ -96,10 +106,11 @@ pub fn send_message(data: &str) -> Result<Option<String>, String> {
     let handle_guard = PIPE_HANDLE.lock().unwrap();
 
     if let Some(handle) = handle_guard.as_ref() {
+        let h = to_handle(*handle);
         let send_bytes = data.as_bytes();
         let mut send_buffer = send_bytes.to_vec();
 
-        let mut write_overlapped = Overlapped::default();
+        let mut write_overlapped = OVERLAPPED::default();
         let write_event = unsafe {
             CreateEventW(std::ptr::null_mut(), BOOL(0), BOOL(0), PCWSTR::null())
         };
@@ -111,7 +122,7 @@ pub fn send_message(data: &str) -> Result<Option<String>, String> {
         let mut written = 0u32;
         let write_result = unsafe {
             windows::Win32::Storage::FileSystem::WriteFile(
-                *handle,
+                h,
                 Some(send_buffer.as_ref()),
                 Some(&mut written),
                 Some(&write_overlapped),
@@ -127,7 +138,7 @@ pub fn send_message(data: &str) -> Result<Option<String>, String> {
                 if wait == WAIT_OBJECT_0 {
                     let mut bytes = 0u32;
                     let got = unsafe {
-                        GetOverlappedResult(*handle, &write_overlapped, &mut bytes, BOOL(0))
+                        windows::Win32::System::IO::GetOverlappedResult(h, &write_overlapped, &mut bytes, BOOL(0))
                     };
                     got.as_bool()
                 } else {
@@ -149,7 +160,7 @@ pub fn send_message(data: &str) -> Result<Option<String>, String> {
         }
 
         let mut read_buffer = vec![0u8; BUFFER_SIZE];
-        let mut read_overlapped = Overlapped::default();
+        let mut read_overlapped = OVERLAPPED::default();
         let read_event = unsafe {
             CreateEventW(std::ptr::null_mut(), BOOL(0), BOOL(0), PCWSTR::null())
         };
@@ -161,7 +172,7 @@ pub fn send_message(data: &str) -> Result<Option<String>, String> {
         let mut read_bytes = 0u32;
         let read_result = unsafe {
             windows::Win32::Storage::FileSystem::ReadFile(
-                *handle,
+                h,
                 Some(&mut read_buffer),
                 Some(&mut read_bytes),
                 Some(&read_overlapped),
@@ -177,7 +188,7 @@ pub fn send_message(data: &str) -> Result<Option<String>, String> {
                 if wait == WAIT_OBJECT_0 {
                     let mut bytes = 0u32;
                     let got = unsafe {
-                        GetOverlappedResult(*handle, &read_overlapped, &mut bytes, BOOL(0))
+                        windows::Win32::System::IO::GetOverlappedResult(h, &read_overlapped, &mut bytes, BOOL(0))
                     };
                     read_bytes = bytes;
                     got.as_bool()

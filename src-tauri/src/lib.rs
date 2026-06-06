@@ -1,5 +1,6 @@
 mod candidate_bar;
 mod ime;
+mod logging;
 mod pipe_server;
 
 use candidate_bar::BarData;
@@ -17,6 +18,7 @@ struct AppState {
     initialized: AtomicBool,
     bar_state: Arc<Mutex<BarData>>,
     bar_hwnd: Arc<Mutex<isize>>,
+    pipe_server: Arc<pipe_server::PipeServer>,
 }
 
 fn lock_bar<'a>(state: &'a AppState) -> Result<std::sync::MutexGuard<'a, BarData>, String> {
@@ -162,6 +164,15 @@ fn create_pipe_handler(handle: AppHandle) -> impl Fn(String) -> Option<String> {
 
         let state: State<AppState> = handle.state();
 
+        if let Some(cursor_x) = msg["cursor_x"].as_i64() {
+            if let Some(cursor_y) = msg["cursor_y"].as_i64() {
+                if let Ok(mut bar) = lock_bar(&state) {
+                    bar.pos_x = cursor_x as i32;
+                    bar.pos_y = cursor_y as i32;
+                }
+            }
+        }
+
         match state.engine.process_key(keycode, modifiers) {
             Ok(KeyResult::Handled(ctx)) => {
                 if !ctx.commit_text.is_empty() {
@@ -174,7 +185,7 @@ fn create_pipe_handler(handle: AppHandle) -> impl Fn(String) -> Option<String> {
             }
             Ok(KeyResult::NotHandled) => Some(r#"{"handled":false}"#.into()),
             Err(e) => {
-                eprintln!("process_key error: {}", e);
+                log::error!("process_key error: {}", e);
                 Some(r#"{"handled":false}"#.into())
             }
         }
@@ -183,9 +194,14 @@ fn create_pipe_handler(handle: AppHandle) -> impl Fn(String) -> Option<String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    logging::init_logging();
+
     let bar_state = Arc::new(Mutex::new(BarData::default()));
     let bar_hwnd: Arc<Mutex<isize>> = Arc::new(Mutex::new(0));
     candidate_bar::start_bar(bar_state.clone(), bar_hwnd.clone());
+
+    let pipe_server = Arc::new(pipe_server::PipeServer::new());
+    let pipe_server_for_spawn = pipe_server.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -221,6 +237,17 @@ pub fn run() {
                             let _ = w.set_focus();
                         }
                     } else if event.id().as_ref() == "quit" {
+                        let state: State<AppState> = app.state();
+                        state.pipe_server.trigger_shutdown();
+                        if let Ok(hwnd) = lock_hwnd(&state) {
+                            if *hwnd != 0 {
+                                unsafe {
+                                    let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(
+                                        windows::Win32::Foundation::HWND(*hwnd as _),
+                                    );
+                                }
+                            }
+                        }
                         app.exit(0);
                     }
                 })
@@ -228,10 +255,9 @@ pub fn run() {
 
             let handle2 = handle.clone();
             tauri::async_runtime::spawn(async move {
-                let server = pipe_server::PipeServer::new();
                 let handler = create_pipe_handler(handle2);
-                if let Err(e) = server.start(handler).await {
-                    eprintln!("Pipe server error: {}", e);
+                if let Err(e) = pipe_server_for_spawn.start(handler).await {
+                    log::error!("Pipe server error: {}", e);
                 }
             });
 
@@ -242,6 +268,7 @@ pub fn run() {
             initialized: AtomicBool::new(false),
             bar_state,
             bar_hwnd,
+            pipe_server,
         })
         .invoke_handler(tauri::generate_handler![
             init_ime,
