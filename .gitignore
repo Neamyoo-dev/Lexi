@@ -24,6 +24,7 @@ dist-ssr
 *.sw?
 
 # Rust / Cargo (generated at compile time)
+.cargo/
 src-tauri/target/
 
 # Tauri generated schemas
