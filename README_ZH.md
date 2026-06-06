@@ -4,6 +4,8 @@
 > 本项目仍在积极开发中，尚不适合日常使用。
 > 许多核心功能尚未完善或不可用。
 
+> **English version available at [README.md](README.md).**
+
 一款极简的 Windows 拼音输入法，基于 Tauri v2 + Rust + Skia 构建。
 
 ## 特性
@@ -46,9 +48,7 @@ cargo tauri dev
 
 ## 贡献指南
 
-欢迎提交 issue 和 pull request！
-
-在提交较大的改动之前，建议先开 issue 讨论方案，避免工作方向偏离项目规划。
+欢迎参与 Lexi 的开发！详情请阅读 **[CONTRIBUTING.md](CONTRIBUTING.md)**。
 
 ## 许可
 

@@ -4,6 +4,8 @@
 > This project is still under heavy development. It is not yet ready for daily use.
 > Many core features are incomplete or non-functional.
 
+> **中文版说明详见 [README_ZH.md](README_ZH.md)。**
+
 A minimalist Chinese input method for Windows, built with Tauri v2 + Rust + Skia.
 
 ## Features
@@ -46,9 +48,7 @@ cargo tauri dev
 
 ## Contributing
 
-Contributions are welcome! Feel free to open issues and pull requests.
-
-Before submitting significant changes, it is recommended to first open an issue to discuss the approach. This helps ensure your effort aligns with the project direction.
+Contributions are welcome! See **[CONTRIBUTING.md](CONTRIBUTING.md)** for details.
 
 ## License
 
