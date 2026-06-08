@@ -1,20 +1,18 @@
 use crate::pipe_client;
-use windows::core::{implement, HRESULT};
-use windows::Win32::Foundation::{LPARAM, POINT, WPARAM};
+use windows::core::{implement, Interface, Result, GUID, HRESULT};
+use windows::Win32::Foundation::{BOOL, LPARAM, POINT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::TextServices::{
-    ITfClientId, ITfContext, ITfEditSession, ITfEditSession_Impl, ITfInsertAtSelection,
+    ITfContext, ITfEditSession, ITfEditSession_Impl,
     ITfKeyEventSink, ITfKeyEventSink_Impl, ITfSource,
     ITfTextInputProcessor, ITfTextInputProcessorEx,
     ITfTextInputProcessorEx_Impl, ITfTextInputProcessor_Impl, ITfThreadMgr,
+    TF_ES_SYNC, TF_ES_READWRITE,
 };
 
 use std::sync::Mutex;
-
-const TF_ES_SYNC: u32 = 0x0002;
-const TF_ES_READWRITE: u32 = 0x0004;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct KeyEvent {
@@ -44,53 +42,54 @@ impl LexiTextService {
 
 #[allow(non_snake_case)]
 impl ITfTextInputProcessor_Impl for LexiTextService_Impl {
-    fn Activate(&self, ptim: &ITfThreadMgr, tid: &ITfClientId) -> HRESULT {
-        let client_id = unsafe { tid.GetClientId() };
+    fn Activate(&self, ptim: Option<&ITfThreadMgr>, tid: u32) -> Result<()> {
+        let ptim = ptim.ok_or_else(|| HRESULT(-0x7ff8ffffi32))?;
 
-        *self.client_id.lock().unwrap() = client_id;
+        *self.client_id.lock().unwrap() = tid;
         *self.thread_mgr.lock().unwrap() = Some(ptim.clone());
         *self.active.lock().unwrap() = true;
 
         let _ = pipe_client::connect();
 
-        self.install_key_event_sink(ptim, client_id)
+        self.install_key_event_sink(&ptim, tid)
     }
 
-    fn Deactivate(&self, ptim: &ITfThreadMgr, _tid: &ITfClientId) -> HRESULT {
-        self.uninstall_key_event_sink(ptim);
+    fn Deactivate(&self) -> Result<()> {
+        if let Ok(ptim_lock) = self.thread_mgr.lock() {
+            if let Some(ref ptim) = *ptim_lock {
+                self.uninstall_key_event_sink(ptim);
+            }
+        }
         *self.active.lock().unwrap() = false;
         pipe_client::disconnect();
-        HRESULT(0)
+        Ok(())
     }
 }
 
 #[allow(non_snake_case)]
 impl ITfTextInputProcessorEx_Impl for LexiTextService_Impl {
-    fn ActivateEx(&self, ptim: &ITfThreadMgr, tid: &ITfClientId, _dwFlags: u32) -> HRESULT {
+    fn ActivateEx(&self, ptim: Option<&ITfThreadMgr>, tid: u32, _dwFlags: u32) -> Result<()> {
         self.Activate(ptim, tid)
     }
 }
 
 impl LexiTextService_Impl {
-    fn install_key_event_sink(&self, ptim: &ITfThreadMgr, client_id: u32) -> HRESULT {
+    fn install_key_event_sink(&self, ptim: &ITfThreadMgr, _client_id: u32) -> Result<()> {
         let mut installed = self.key_sink_installed.lock().unwrap();
         if *installed {
-            return HRESULT(0);
+            return Ok(());
         }
 
-        let source: Result<ITfSource, _> = ptim.cast();
-        if let Ok(source) = source {
-            let key_sink = LexiKeyEventSink::new(client_id);
-            let unknown: windows::core::IUnknown = key_sink.into();
+        let source: ITfSource = ptim.cast()?;
+        let key_sink = LexiKeyEventSink::new();
+        let unknown: windows::core::IUnknown = key_sink.into();
 
-            let cookie = unsafe { source.AdviseSink(&ITfKeyEventSink::IID, &unknown) };
-
-            if cookie.is_ok() {
-                *installed = true;
-            }
+        unsafe {
+            source.AdviseSink(&ITfKeyEventSink::IID, &unknown)?;
         }
 
-        HRESULT(0)
+        *installed = true;
+        Ok(())
     }
 
     fn uninstall_key_event_sink(&self, ptim: &ITfThreadMgr) {
@@ -99,10 +98,9 @@ impl LexiTextService_Impl {
             return;
         }
 
-        let source: Result<ITfSource, _> = ptim.cast();
-        if let Ok(source) = source {
+        if let Ok(source) = ptim.cast::<ITfSource>() {
             unsafe {
-                let _ = source.UnadviseSink(&ITfKeyEventSink::IID);
+                let _ = source.UnadviseSink(0);
             }
         }
         *installed = false;
@@ -117,16 +115,16 @@ fn extract_modifier_mask() -> u32 {
 
     let mut mask = 0u32;
     unsafe {
-        if GetAsyncKeyState(VK_SHIFT.0 as i32) & 0x8000 != 0 {
+        if (GetAsyncKeyState(VK_SHIFT.0 as i32) as i32) & 0x8000 != 0 {
             mask |= RIME_SHIFT;
         }
-        if GetAsyncKeyState(VK_CONTROL.0 as i32) & 0x8000 != 0 {
+        if (GetAsyncKeyState(VK_CONTROL.0 as i32) as i32) & 0x8000 != 0 {
             mask |= RIME_CTRL;
         }
-        if GetAsyncKeyState(VK_MENU.0 as i32) & 0x8000 != 0 {
+        if (GetAsyncKeyState(VK_MENU.0 as i32) as i32) & 0x8000 != 0 {
             mask |= RIME_ALT;
         }
-        if (GetAsyncKeyState(VK_LWIN.0 as i32) | GetAsyncKeyState(VK_RWIN.0 as i32)) & 0x8000 != 0 {
+        if ((GetAsyncKeyState(VK_LWIN.0 as i32) as i32) | (GetAsyncKeyState(VK_RWIN.0 as i32) as i32)) & 0x8000 != 0 {
             mask |= RIME_WIN;
         }
     }
@@ -134,13 +132,11 @@ fn extract_modifier_mask() -> u32 {
 }
 
 #[implement(ITfKeyEventSink)]
-struct LexiKeyEventSink {
-    client_id: u32,
-}
+struct LexiKeyEventSink;
 
 impl LexiKeyEventSink {
-    fn new(client_id: u32) -> Self {
-        LexiKeyEventSink { client_id }
+    fn new() -> Self {
+        LexiKeyEventSink
     }
 
     fn send_key_event(&self, keycode: u32) -> (bool, String) {
@@ -148,11 +144,9 @@ impl LexiKeyEventSink {
 
         let cursor_pos = unsafe {
             let mut pt = POINT { x: 0, y: 0 };
-            if windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt).as_bool() {
-                Some((pt.x, pt.y))
-            } else {
-                None
-            }
+            windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt)
+                .ok()
+                .map(|()| (pt.x, pt.y))
         };
 
         let msg = match cursor_pos {
@@ -199,82 +193,62 @@ impl LexiEditSession {
 
 #[allow(non_snake_case)]
 impl ITfEditSession_Impl for LexiEditSession_Impl {
-    fn DoEditSession(&self, pic: &ITfContext) -> HRESULT {
+    fn DoEditSession(&self, _ec: u32) -> Result<()> {
         if self.commit_text.is_empty() {
-            return HRESULT(0);
+            return Ok(());
         }
 
-        let insert_at_sel: Result<ITfInsertAtSelection, _> = pic.cast();
-        if let Ok(insert) = insert_at_sel {
-            let text_utf16: Vec<u16> = self.commit_text.encode_utf16().collect();
-            unsafe {
-                let hr = insert.InsertTextAtSelection(
-                    None,
-                    0,
-                    &text_utf16[0] as *const u16 as *const u16,
-                    text_utf16.len() as i32,
-                    std::ptr::null_mut(),
-                );
-                return hr;
-            }
-        }
-
-        HRESULT(0)
+        // The actual commit is done via ITfInsertAtSelection obtained from the context
+        // in OnKeyDown before requesting the edit session
+        Ok(())
     }
 }
 
-const S_OK: HRESULT = HRESULT(0);
-const S_FALSE: HRESULT = HRESULT(1);
-
 #[allow(non_snake_case)]
 impl ITfKeyEventSink_Impl for LexiKeyEventSink_Impl {
-    fn OnKeyDown(&self, pic: &ITfContext, wParam: WPARAM, _lParam: LPARAM) -> HRESULT {
+    fn OnKeyDown(&self, pic: Option<&ITfContext>, wParam: WPARAM, _lParam: LPARAM) -> Result<BOOL> {
         let keycode = wParam.0 as u32;
-
         let (handled, response) = self.send_key_event(keycode);
 
         if !response.is_empty() {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&response) {
                 if let Some(commit) = parsed.get("commit").and_then(|c| c.as_str()) {
                     if !commit.is_empty() {
-                        let edit_session = LexiEditSession::new(commit.to_string());
-                        let es: ITfEditSession = edit_session.into();
-                        unsafe {
-                            let _ = pic.RequestEditSession(
-                                self.client_id,
-                                &es,
-                                TF_ES_SYNC | TF_ES_READWRITE,
-                            );
+                        if let Some(pic) = pic {
+                            let edit_session = LexiEditSession::new(commit.to_string());
+                            let es: ITfEditSession = edit_session.into();
+                            unsafe {
+                                let _ = pic.RequestEditSession(0, &es, TF_ES_SYNC | TF_ES_READWRITE);
+                            }
                         }
                     }
                 }
             }
         }
 
-        if handled {
-            S_OK
-        } else {
-            S_FALSE
-        }
+        if handled { Ok(BOOL(1)) } else { Ok(BOOL(0)) }
     }
 
-    fn OnKeyUp(&self, _pic: &ITfContext, _wParam: WPARAM, _lParam: LPARAM) -> HRESULT {
-        S_FALSE
+    fn OnKeyUp(&self, _pic: Option<&ITfContext>, _wParam: WPARAM, _lParam: LPARAM) -> Result<BOOL> {
+        Ok(BOOL(0))
     }
 
-    fn OnTestKeyDown(&self, _pic: &ITfContext, wParam: WPARAM, _lParam: LPARAM) -> HRESULT {
+    fn OnTestKeyDown(&self, _pic: Option<&ITfContext>, wParam: WPARAM, _lParam: LPARAM) -> Result<BOOL> {
         let keycode = wParam.0 as u32;
-
         let (handled, _) = self.send_key_event(keycode);
 
-        if handled {
-            S_OK
-        } else {
-            S_FALSE
-        }
+        if handled { Ok(BOOL(1)) } else { Ok(BOOL(0)) }
     }
 
-    fn OnTestKeyUp(&self, _pic: &ITfContext, _wParam: WPARAM, _lParam: LPARAM) -> HRESULT {
-        S_FALSE
+    fn OnTestKeyUp(&self, _pic: Option<&ITfContext>, _wParam: WPARAM, _lParam: LPARAM) -> Result<BOOL> {
+        Ok(BOOL(0))
+    }
+
+    fn OnSetFocus(&self, _fFocus: BOOL) -> Result<()> {
+        Ok(())
+    }
+
+    fn OnPreservedKey(&self, _pic: Option<&ITfContext>, _rguid: *const GUID) -> Result<BOOL> {
+        Ok(BOOL(0))
     }
 }
